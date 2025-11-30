@@ -1,0 +1,10 @@
+services:
+  yt-proxy:
+    build: .
+    container_name: yt-proxy
+    ports:
+      - "8085:8080"
+    volumes:
+      # Persists downloads so they survive container restarts (optional)
+      - ./downloads_cache:/app/downloads
+    restart: unless-stopped
