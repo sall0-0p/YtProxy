@@ -9,48 +9,76 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Service
 public class VideoService {
 
     private static final Logger log = LoggerFactory.getLogger(VideoService.class);
     private static final String STORAGE_DIR = "/app/downloads";
-    private final ConcurrentHashMap<String, ReentrantLock> locks = new ConcurrentHashMap<>();
 
-    public File getOrDownloadVideo(String fullUrl) throws IOException, InterruptedException {
-        File directory = new File(STORAGE_DIR);
-        if (!directory.exists()) {
-            directory.mkdirs();
-        }
+    // Tracks which files are currently being downloaded to prevent duplicates
+    private final ConcurrentHashMap<String, Boolean> activeDownloads = new ConcurrentHashMap<>();
 
-        String fileId = String.valueOf(Math.abs(fullUrl.hashCode()));
-        String fileName = fileId + ".mp4";
-        File file = new File(directory, fileName);
+    // Limits concurrent downloads to 4 to save system resources
+    private final ExecutorService executor = Executors.newFixedThreadPool(4);
 
-        if (file.exists()) {
+    /**
+     * returns the File object if it exists on disk, otherwise returns null.
+     */
+    public File getFileIfReady(String fullUrl) {
+        String fileName = getFileName(fullUrl);
+        File file = new File(STORAGE_DIR, fileName);
+
+        if (file.exists() && file.length() > 0) {
             return file;
         }
+        return null;
+    }
 
-        ReentrantLock lock = locks.computeIfAbsent(fileId, k -> new ReentrantLock());
-        lock.lock();
-        try {
-            if (file.exists()) {
-                return file;
+    /**
+     * Checks if a download is running. If not, starts it asynchronously.
+     */
+    public void startDownloadAsync(String fullUrl) {
+        String fileName = getFileName(fullUrl);
+        String fileId = fileName; // using filename as ID
+
+        // If already downloading, do nothing
+        if (activeDownloads.containsKey(fileId)) {
+            return;
+        }
+
+        // Mark as active
+        activeDownloads.put(fileId, true);
+
+        // Submit task to background thread pool
+        executor.submit(() -> {
+            try {
+                performDownload(fullUrl, new File(STORAGE_DIR, fileName).getAbsolutePath());
+            } catch (Exception e) {
+                log.error("Download failed for {}", fullUrl, e);
+            } finally {
+                // Remove from active list when done (success or failure)
+                activeDownloads.remove(fileId);
             }
-            performDownload(fullUrl, file.getAbsolutePath());
-            return file;
-        } finally {
-            lock.unlock();
-        }
+        });
+    }
+
+    private String getFileName(String fullUrl) {
+        // Ensures directory exists
+        new File(STORAGE_DIR).mkdirs();
+        String fileId = String.valueOf(Math.abs(fullUrl.hashCode()));
+        return fileId + ".mp4";
     }
 
     private void performDownload(String url, String outputPath) throws IOException, InterruptedException {
-        log.info("Starting download for URL: {}", url);
+        log.info("Background download started: {}", url);
 
         ProcessBuilder builder = new ProcessBuilder(
                 "yt-dlp",
-                "--newline", // Forces progress to print on new lines so Java captures it
+                "--newline",
+                "--no-playlist", // Prevents downloading the whole list if URL has &list=...
                 "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]",
                 "-o", outputPath,
                 url
@@ -62,7 +90,6 @@ public class VideoService {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                // Log only lines containing progress info or warnings to keep it clean but visible
                 if (line.contains("[download]") || line.contains("ERROR") || line.contains("WARNING")) {
                     log.info("yt-dlp: {}", line);
                 }
@@ -71,9 +98,10 @@ public class VideoService {
 
         int exitCode = process.waitFor();
         if (exitCode != 0) {
+            new File(outputPath).delete();
             throw new IOException("yt-dlp failed with exit code " + exitCode);
         }
 
-        log.info("Download completed successfully: {}", outputPath);
+        log.info("Background download finished: {}", outputPath);
     }
 }
